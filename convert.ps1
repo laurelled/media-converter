@@ -8,6 +8,7 @@
 # --- CONFIGURAZIONE ---
 $cartellaSorgente = ".\FILMATI MACCHINE PER ATTREZZAGGIOO"
 $cartellaDestinazione = ".\prova"
+# Necessario avere nel PATH le cartelle dei bin di HandBrakeCLI e ffmpeg
 $handbrakePath = "HandBrakeCLI"
 $ffmpegPath = "ffmpeg"
 
