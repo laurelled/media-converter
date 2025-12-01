@@ -1,61 +1,96 @@
 ﻿<#
 .SYNOPSIS
-    Script "Basta che funzioni".
-    - Ignora il codice di errore se il file viene comunque creato.
-    - Logica: Se il file .tmp esiste ed è > 0 byte, è un successo.
+    Script per comprimere le dimensioni dei media (immagine e video) periodicamente. È pensato per funzionare in due modi:
+    - CLASSICO: La classica conversione partendo da una cartella sorgente a una di destinazione per i task una tantum
+    - WATCH: Eseguirlo periodicamente, in modo tale che se dei media vengono aggiunti nella cartella che viene osservata, vengono compressi alla prossima esecuzione
+    È possibile selezionare la modalità specificando il parametro -Watch
+.PARAMETER Src
+La cartella sorgente che contiene i media da comprimere.
+.PARAMETER Dest
+La cartella che conterrà gli output compressi. Se -Watch è specificato, questo parametro non verrà usato.
+.PARAMETER Watch
+Se specificato, lo script non richiederà due cartelle, bensì controllerà nel path specificato con -Source sono stati aggiunti dei file dall'ultima volta che lo script è stato eseguito, e in caso positivo li converte.
 #>
 
+[CmdletBinding(DefaultParameterSetName = 'None')] 
+param(
+    [Parameter(Mandatory)][string]$Src,
+    [string]$Dest,
+    [switch]$watch
+)
+
 # --- CONFIGURAZIONE ---
-$cartellaSorgente = ".\FILMATI MACCHINE PER ATTREZZAGGIOO"
-$cartellaDestinazione = ".\prova"
 # Necessario avere nel PATH le cartelle dei bin di HandBrakeCLI e ffmpeg
 $handbrakePath = "HandBrakeCLI"
 $ffmpegPath = "ffmpeg"
-
-<#
-# --- GESTIONE INTERRUZIONE (CTRL+C) ---
-$script:currentTempFile = $null
-[Console]::TreatControlCAsInput = $false
-$action = {
-    Write-Host "`n!!! INTERRUZIONE (CTRL+C) !!!" -ForegroundColor Red
-    if ($script:currentTempFile -and (Test-Path $script:currentTempFile)) {
-        Remove-Item $script:currentTempFile -Force -ErrorAction SilentlyContinue
-        Write-Host "File parziale rimosso." -ForegroundColor Yellow
-    }
-    Exit
-}
-Register-EngineEvent -SourceIdentifier ([System.Management.Automation.PsEngineEvent]::Exiting) -Action $action | Out-Null
-#>
-<#
-function WriteLog {
-    Param ([string]$LogString)
-    $Stamp = (Get-Date).toString("yyyy/MM/dd HH:mm:ss")
-    $LogMessage = "$Stamp $LogString"
-    Write-Host $LogMessage
-    Add-content $LogFile -value $LogMessage -Encoding UTF8
-}#>
 
 # --- FILTRI ---
 $estensioniImmagini = @(".jpg", ".jpeg", ".png", ".bmp", ".tiff")
 $estensioniVideo = @(".mp4", ".mov", ".avi", ".mkv", ".m4v", ".wmv", ".flv", ".mts")
 $handbrakePreset = "Fast 1080p30"
 
+$lastSnapshotFile = Join-Path $Src "\.conversion_snapshot"
+$lastFolderSnapshot = @()
+$isWatchMode = $PSBoundParameters.ContainsKey('Watch')
+
 # --- INIZIO ---
 Clear-Host
-Write-Host "--- SCRIPT: VERIFICA BASATA SUL FILE REALE ---" -ForegroundColor Cyan
-try { & $ffmpegPath -version | Out-Null } catch { Write-Error "FFmpeg non trovato!"; exit }
-try { & $handbrakePath --version | Out-Null } catch { Write-Error "FFmpeg non trovato!"; exit }
+Write-Host "--- SCRIPT: CONVERTI & COMPRIMI MEDIA ---" -ForegroundColor Cyan
 
-if (!(Test-Path $cartellaDestinazione)) { New-Item -ItemType Directory -Path $cartellaDestinazione | Out-Null }
-$files = Get-ChildItem -Path $cartellaSorgente -Recurse -File
+function WriteSnapshotFile {
+    if (!(Test-Path $lastSnapshotFile)) { New-Item -ItemType File $lastSnapshotFile | Out-Null }
+    Set-ItemProperty -Path $lastSnapshotFile -Name IsReadOnly -Value $false
+    Write-Output (Get-Item $lastSnapshotFile).Directory.FullName >> $lastSnapshotFile
+    (Get-ChildItem -Path $Src -Recurse -Directory) | ForEach-Object { (Write-Output $_.FullName) >> $lastSnapshotFile }
+    Set-ItemProperty -Path $lastSnapshotFile -Name IsReadOnly -Value $true 
+}
+
+# --- CHECK PARAMETRI ---
+# Se il file di snapshot esiste già, ci sono delle cartelle che possiamo saltare che sono già state compresse.
+if ($isWatchMode) {
+    if ((Test-Path $lastSnapshotFile) -and ((Get-Item $lastSnapshotFile).Length -gt 0)) { 
+        $lastFolderSnapshot = Get-Content -Path $lastSnapshotFile
+    }
+    else {
+        Write-Host "È stata eseguita la modalità Watch, ma il file .conversion_snapshot non esiste! Creato il file, ora ogni cartella che viene aggiunta verrà convertita."
+        WriteSnapshotFile
+        exit
+    }
+}
+if (!(Test-Path $Src)) { Write-Error "La cartella sorgente ($Src) non esiste!"; exit }
+if (!(Test-Path $Dest) -and $PSBoundParameters.ContainsKey('Dest')) { New-Item -ItemType Directory -Path $Dest | Out-Null }
+try { & $ffmpegPath -version | Out-Null } catch { Write-Error "FFmpeg non trovato!"; exit }
+try { & $handbrakePath --version 2>1 | Out-Null } catch { Write-Error "HandBrakeCLI non trovato!"; exit }
+
+
+
+$files = Get-ChildItem -Path $Src -Recurse -File
+
+# Seleziono solo quei file che sono stati inseriti nella cartella dopo l'ultima esecuzione del file
+if ($isWatchMode) {
+    
+    $files = $files | Where-Object { !($lastFolderSnapshot.Contains($_.Directory.FullName)) }
+    if ($files.Length -eq 0) {
+        Write-Host "Non ci sono file da comprimere!"
+        Start-Sleep 5
+        exit
+    }
+}
 
 foreach ($file in $files) {
     # 1. Calcoli Percorsi
-    $rootLength = (Get-Item $cartellaSorgente).FullName.Length + 1
+    $rootLength = (Get-Item $Src).FullName.Length + 1
     $percorsoRelativoCompleto = $file.FullName.Substring($rootLength)
     $baseName = [System.IO.Path]::GetFileNameWithoutExtension($file.Name)
     $relativeDirPath = [System.IO.Path]::GetDirectoryName($percorsoRelativoCompleto)
-    $targetDir = Join-Path $cartellaDestinazione $relativeDirPath
+    $targetDir = ""
+    
+    if (!$isWatchMode) {
+        $targetDir = (Join-Path $Dest $relativeDirPath)
+    }
+    else {
+        $targetDir = (Get-Item $file).Directory.FullName # ignoro la directory Dest se -Watch è stato attivato
+    }
     
     $newExtension = $file.Extension
     $isImage = $false; $isVideo = $false
@@ -68,50 +103,39 @@ foreach ($file in $files) {
 
     if (!(Test-Path $targetDir)) { New-Item -ItemType Directory -Path $targetDir | Out-Null }
 
-    if (Test-Path $fileDestinazione) {
-        Write-Host "$(Get-Date) ├── $percorsoRelativoCompleto -> [GIA' ESISTENTE, SKIPPATO]" -ForegroundColor DarkYellow
-        continue
-    }
-
     $script:currentTempFile = $fileTemporaneo
     $outputPrefix = "$(Get-Date) ├── "
 
-   
-    
 
     if ($isImage -or $isVideo) {
-        $cmdArgs = ""
-        $msgType = ""
-        $execPath = ""
+        $conversionOutput = ""
+        $cmdArgs = @(
+            "-i", $file.FullName
+        )
+
+        Write-Host "$outputPrefix$percorsoRelativoCompleto..." -NoNewline
 
         if ($isImage) {
-            $cmdArgs = @(
-                "-i", $file.FullName, # Input File (il percorso con spazi viene quotato correttamente)
-                "-f", "image2",
-                "-y", $fileTemporaneo # Output File (il percorso con spazi viene quotato correttamente)
+            $cmdArgs += @(
+                "-f", "image2", 
+                "-y", $fileTemporaneo
             )
-            $msgType = "IMMAGINE"
-            $execPath = $ffmpegPath
+            $conversionOutput = & $ffmpegPath $cmdArgs 2>&1
         }
         else {
-            $cmdArgs = @(
-                "-i", $file.FullName,
+            $cmdArgs += @(
                 "--preset", $handbrakePreset,
                 "-o", $fileTemporaneo
             )
-            $msgType = "VIDEO"
-            $execPath = $handbrakePath
+            $conversionOutput = & $handbrakePath $cmdArgs 2>&1
         }
-
-        Write-Host "$outputPrefix$percorsoRelativoCompleto ($msgType)..." -NoNewline
-
         # --- ESECUZIONE ---
         # Catturiamo l'output, ma la decisione la prendiamo sul FILE.
-        
-        $conversionOutput = & $execPath $cmdArgs 2>&1
         $exitCode = $LASTEXITCODE
+        
 
-        # --- CONTROLLO ROBUSTO (FILE CHECK) ---
+
+        # --- CONTROLLO ROBUSTO ---
         # Verifica se il file esiste ED è più grande di 0 byte.
         $fileCreatoCorrettamente = (Test-Path $fileTemporaneo) -and ((Get-Item $fileTemporaneo).Length -gt 0)
 
@@ -132,20 +156,29 @@ foreach ($file in $files) {
             # CASO FALLIMENTO: Il file non c'è o è vuoto (0 byte)
             Write-Host " [ERRORE REALE]" -ForegroundColor Red
             Write-Host "    Codice Uscita: $exitCode" -ForegroundColor DarkRed
-            Write-Host "    FFmpeg Output (ultime 5 righe):" -ForegroundColor DarkRed
-            $conversionOutput | Select-Object -Last 5 | ForEach-Object { Write-Host "    $_" -ForegroundColor DarkRed }
+            Write-Host "    Media Converter Output:" -ForegroundColor DarkRed
+            $conversionOutput | ForEach-Object { Write-Host "    $_" -ForegroundColor DarkRed }
             
             if (Test-Path $fileTemporaneo) { Remove-Item $fileTemporaneo -Force }
         }
 
     }
-    else {
+    elseif (!$isWatchMode) {
+        # impedisce di fare operazioni inutili di copia se stiamo solo controllando la stessa cartella
         Copy-Item -Path $file.FullName -Destination $fileDestinazione -Force
         (Get-Item $fileDestinazione).LastWriteTime = (Get-Item $file.FullName).LastWriteTime
         Write-Host "$outputPrefix$percorsoRelativoCompleto -> [COPIA]" -ForegroundColor Gray
     }
     
     $script:currentTempFile = $null
+}
+
+
+# --- CREAZIONE DELLO SNAPSHOT DELLE CARTELLE ---
+# Disattivo temporaneamente il readonly per andare a scrivere dentro tutte le cartelle presenti in questo momento.
+# Se in futuro verranno aggiunte altre, non saranno presenti nel file (che non si può modificare) e verranno compresse.
+if ($isWatchMode) {
+    WriteSnapshotFile
 }
 
 # Cleanup finale
